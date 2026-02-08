@@ -1,0 +1,555 @@
+[config]
+default_to_workspace = false
+
+[env]
+CARGO_MAKE_CLIPPY_ARGS = "-- --no-deps"
+CARGO_MAKE_COVERAGE_PROVIDER = "llvm-cov"
+CARGO_MAKE_CARGO_BUILD_TEST_FLAGS = ""
+GATEWAY_API_VERSION = "1.2.1"
+# This is the directory where we generate the CLI's reference
+# documentation.
+CLI_REFERENCE_DIR = "target/debug/"
+# This is the name of the file containing the CLI's reference
+# documentation.
+CLI_REFERENCE_FILE_NAME = "reference.md"
+
+[env.development]
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+
+[tasks.dev-test-flow]
+dependencies = [
+  "pre-build",
+  "format-flow",
+  "clippy-flow",
+  "build",
+  "post-build",
+  "pre-docs",
+  "docs",
+  "post-docs",
+  "test-flow",
+]
+
+[tasks.pre-build]
+dependencies = ["format-toml-conditioned-flow", "unused-dependencies-flow"]
+
+[tasks.ci-flow]
+dependencies = [
+  "pre-ci-flow",
+  "print-env-flow",
+  "pre-build",
+  "check-format-flow",
+  "clippy-flow",
+  "build",
+  "post-build",
+  "pre-docs",
+  "docs",
+  "post-docs",
+  "test-flow",
+  "coverage-flow",
+  "post-ci-flow",
+]
+
+[tasks.test]
+workspace = true
+description = "Run our test suite"
+command = "cargo"
+args = [
+  "nextest",
+  "run",
+  "--locked",
+  "@@remove-empty(CARGO_MAKE_CARGO_VERBOSE_FLAGS)",
+  "@@split(CARGO_MAKE_CARGO_BUILD_TEST_FLAGS, )",
+]
+
+[tasks.help]
+command = "cargo"
+description = "List help text for multiway executable"
+category = "Development"
+args = [
+  "run",
+  "-p",
+  "multiway",
+  "@@remove-empty(CARGO_MAKE_CARGO_VERBOSE_FLAGS)",
+  "@@split(CARGO_MAKE_CARGO_BUILD_TEST_FLAGS, )",
+  "--",
+  "--help",
+]
+
+[tasks.outdated]
+workspace = true
+description = "List dependencies with newer released versions"
+args = ["outdated", "--root-deps-only", "--exit-code", "1"]
+
+[tasks.fmt]
+workspace = true
+alias = "format"
+
+[tasks.check-format]
+workspace = true
+
+[tasks.wc]
+description = "Calculate the LoC in src."
+category = "Development"
+command = "tokei"
+args = ["."]
+
+[tasks.gen-cli-reference]
+description = "Generate the CLI's reference documentation in Markdown format"
+category = "Development"
+script_runner = "@shell"
+script = '''
+  mkdir -p $CLI_REFERENCE_DIR || true
+  cargo run --bin mkdown-docs --features=markdown > $CLI_REFERENCE_DIR/$CLI_REFERENCE_FILE_NAME
+'''
+
+[tasks.bacon]
+description = "Watch tests and rerun on file change."
+category = "Development"
+command = "bacon"
+args = [
+  "nextest",
+  "--",
+  "--workspace",
+  "@@split(CARGO_MAKE_CARGO_BUILD_TEST_FLAGS, )",
+]
+
+[tasks.do-create]
+description = "Create a DigitalOcean Kubernetes cluster for Gateway testing"
+category = "Kubernetes"
+script_runner = "bash"
+script = '''
+set -e
+CLUSTER_NAME="${DO_CLUSTER_NAME:-multiway-local}"
+REGION="${DO_REGION:-nyc3}"
+NODE_SIZE="s-2vcpu-4gb"
+NODE_COUNT=4
+
+echo "Creating DigitalOcean Kubernetes cluster..."
+echo "  Cluster name: ${CLUSTER_NAME}"
+echo "  Region: ${REGION}"
+echo "  Node size: ${NODE_SIZE}"
+echo "  Node count: ${NODE_COUNT}"
+
+doctl kubernetes cluster create "${CLUSTER_NAME}" \
+  --region "${REGION}" \
+  --size "${NODE_SIZE}" \
+  --count "${NODE_COUNT}" \
+  --wait
+
+echo "Cluster created successfully. Saving kubeconfig..."
+doctl kubernetes cluster kubeconfig save "${CLUSTER_NAME}"
+'''
+
+[tasks.do-delete]
+description = "Delete the DigitalOcean Kubernetes cluster"
+category = "Kubernetes"
+script_runner = "bash"
+script = '''
+CLUSTER_NAME="${DO_CLUSTER_NAME:-multiway-local}"
+echo "Deleting DigitalOcean Kubernetes cluster: ${CLUSTER_NAME}"
+doctl kubernetes cluster delete "${CLUSTER_NAME}" --force --dangerous
+'''
+
+[tasks.do-list]
+description = "List DigitalOcean Kubernetes clusters"
+category = "Kubernetes"
+command = "doctl"
+args = ["kubernetes", "cluster", "list"]
+
+[tasks.do-use]
+description = "Set kubectl context to the DigitalOcean cluster"
+category = "Kubernetes"
+script_runner = "bash"
+script = '''
+CLUSTER_NAME="${DO_CLUSTER_NAME:-multiway-local}"
+echo "Saving kubeconfig for cluster: ${CLUSTER_NAME}"
+doctl kubernetes cluster kubeconfig save "${CLUSTER_NAME}"
+'''
+
+[tasks.do-push-images]
+description = "Push control plane and data plane images to container registry"
+category = "Kubernetes"
+dependencies = ["docker-build-all"]
+script_runner = "bash"
+script = '''
+set -e
+if [ -z "$DOCKER_REGISTRY" ]; then
+  echo "Error: DOCKER_REGISTRY environment variable not set"
+  echo "Example: export DOCKER_REGISTRY=ghcr.io/myorg"
+  exit 1
+fi
+
+echo "Tagging and pushing control plane image..."
+docker tag multiway-controlplane:latest ${DOCKER_REGISTRY}/multiway-controlplane:latest
+docker push ${DOCKER_REGISTRY}/multiway-controlplane:latest
+
+echo "Tagging and pushing data plane image..."
+docker tag multiway-dataplane:latest ${DOCKER_REGISTRY}/multiway-dataplane:latest
+docker push ${DOCKER_REGISTRY}/multiway-dataplane:latest
+
+echo "Images pushed successfully to ${DOCKER_REGISTRY}"
+'''
+
+[tasks.gateway-api-refresh]
+description = "Download and split the Gateway API CRDs"
+category = "Kubernetes"
+script_runner = "@shell"
+# Default: BSD awk compatible (macOS)
+script = '''
+set -e
+VERSION_DIR=".crds/v${GATEWAY_API_VERSION}"
+mkdir -p "$VERSION_DIR"
+TEMP_FILE=$(mktemp)
+curl -sL "https://github.com/kubernetes-sigs/gateway-api/releases/download/v${GATEWAY_API_VERSION}/standard-install.yaml" -o "$TEMP_FILE"
+
+awk -v dir="$VERSION_DIR" '
+  /^# config\/crd\/standard\/gateway.networking.k8s.io_/ {
+    # Extract name between _ and .yaml (BSD awk compatible)
+    sub(/.*gateway.networking.k8s.io_/, "")
+    sub(/\.yaml.*/, "")
+    name = $0
+    if (name == "backendtlspolicies") file = "backend-tls-policies.yml"
+    else if (name == "gatewayclasses") file = "gateway-class.yml"
+    else if (name == "gateways") file = "gateway.yml"
+    else if (name == "grpcroutes") file = "grpc.yml"
+    else if (name == "httproutes") file = "http.yml"
+    else if (name == "referencegrants") file = "reference-grants.yml"
+    else file = name ".yml"
+    output = dir "/" file
+    next
+  }
+  /^---$/ { next }
+  output { print > output }
+' "$TEMP_FILE"
+
+rm "$TEMP_FILE"
+'''
+
+[tasks.gateway-api-refresh.linux]
+script = '''
+set -e
+VERSION_DIR=".crds/v${GATEWAY_API_VERSION}"
+mkdir -p "$VERSION_DIR"
+TEMP_FILE=$(mktemp)
+curl -sL "https://github.com/kubernetes-sigs/gateway-api/releases/download/v${GATEWAY_API_VERSION}/standard-install.yaml" -o "$TEMP_FILE"
+
+awk -v dir="$VERSION_DIR" '
+  /^# config\/crd\/standard\/gateway.networking.k8s.io_/ {
+    # Extract name using GNU awk capture groups
+    match($0, /_([a-z]+)\.yaml/, arr)
+    name = arr[1]
+    if (name == "backendtlspolicies") file = "backend-tls-policies.yml"
+    else if (name == "gatewayclasses") file = "gateway-class.yml"
+    else if (name == "gateways") file = "gateway.yml"
+    else if (name == "grpcroutes") file = "grpc.yml"
+    else if (name == "httproutes") file = "http.yml"
+    else if (name == "referencegrants") file = "reference-grants.yml"
+    else file = name ".yml"
+    output = dir "/" file
+    next
+  }
+  /^---$/ { next }
+  output { print > output }
+' "$TEMP_FILE"
+
+rm "$TEMP_FILE"
+'''
+
+[tasks.gateway-api-sync]
+description = "Download CRDs and regenerate Rust bindings"
+category = "Kubernetes"
+dependencies = ["gateway-api-refresh", "gen-crds"]
+
+[tasks.gateway-api-install]
+description = "Install the Gateway API CRDs"
+category = "Kubernetes"
+script_runner = "@shell"
+script = '''
+kubectl apply --server-side -f .crds/v${GATEWAY_API_VERSION}/
+'''
+
+[tasks.deploy]
+description = "Deploy the gateway controller to the cluster"
+category = "Kubernetes"
+command = "kubectl"
+args = ["apply", "-k", "deploy/"]
+
+[tasks.gen-crds]
+description = "Generate CRDS from YAML"
+category = "Development"
+script_runner = "bash"
+script = '''
+gen_crd() { kopium --filename .crds/v${GATEWAY_API_VERSION}/${1}.yml | rustfmt > crates/gateway-crds/src/${1//-/_}.rs; }
+# gen_crd backend-tls-policies  # Not available in v1.2.1
+gen_crd gateway
+gen_crd gateway-class
+gen_crd grpc
+gen_crd http
+gen_crd reference-grants
+'''
+
+# Conformance Test Tasks
+# These tasks build and run the Gateway API conformance tests in a Kubernetes cluster.
+
+[tasks.conformance-build]
+description = "Build the conformance test Docker image"
+category = "Conformance"
+script_runner = "@shell"
+script = '''
+docker build \
+  --build-arg GATEWAY_API_VERSION=${GATEWAY_API_VERSION} \
+  -t multiway-conformance:latest \
+  -t multiway-conformance:v${GATEWAY_API_VERSION} \
+  conformance/
+'''
+
+[tasks.conformance-push]
+description = "Push the conformance test image to the container registry"
+category = "Conformance"
+script_runner = "@shell"
+script = '''
+set -e
+if [ -z "$DOCKER_REGISTRY" ]; then
+  echo "Error: DOCKER_REGISTRY environment variable not set"
+  echo "Example: export DOCKER_REGISTRY=ghcr.io/myorg"
+  exit 1
+fi
+
+echo "Tagging conformance image for registry..."
+docker tag multiway-conformance:latest ${DOCKER_REGISTRY}/multiway-conformance:latest
+
+echo "Pushing conformance image to registry..."
+docker push ${DOCKER_REGISTRY}/multiway-conformance:latest
+'''
+
+[tasks.conformance-cleanup]
+description = "Delete conformance test job and resources"
+category = "Conformance"
+script_runner = "@shell"
+script = '''
+kubectl delete job gateway-api-conformance -n gateway-conformance-infra --ignore-not-found=true
+'''
+
+[tasks.conformance-run]
+description = "Run the conformance test job in Kubernetes"
+category = "Conformance"
+dependencies = ["conformance-cleanup"]
+script_runner = "@shell"
+script = '''
+set -e
+
+echo "Applying conformance test resources..."
+kubectl apply -f conformance/job.yaml
+
+echo ""
+echo "Waiting for conformance test job to complete..."
+echo "(This may take several minutes)"
+echo ""
+
+# Poll for job completion (either Complete or Failed condition)
+TIMEOUT=1800  # 30 minutes
+ELAPSED=0
+INTERVAL=5
+
+while [ $ELAPSED -lt $TIMEOUT ]; do
+  # Get the job status conditions
+  STATUS=$(kubectl get job gateway-api-conformance -n gateway-conformance-infra \
+    -o jsonpath='{.status.conditions[?(@.status=="True")].type}' 2>/dev/null || echo "")
+
+  if echo "$STATUS" | grep -q "Complete"; then
+    echo ""
+    echo "Conformance tests completed successfully!"
+    EXIT_CODE=0
+    break
+  elif echo "$STATUS" | grep -q "Failed"; then
+    echo ""
+    echo "Conformance tests failed!"
+    EXIT_CODE=1
+    break
+  fi
+
+  sleep $INTERVAL
+  ELAPSED=$((ELAPSED + INTERVAL))
+done
+
+# Check if we timed out
+if [ $ELAPSED -ge $TIMEOUT ]; then
+  echo ""
+  echo "Conformance tests timed out after 30 minutes!"
+  EXIT_CODE=1
+fi
+
+echo ""
+echo "=== Conformance Test Logs ==="
+echo ""
+kubectl logs -n gateway-conformance-infra job/gateway-api-conformance --tail=-1
+
+exit $EXIT_CODE
+'''
+
+[tasks.conformance-logs]
+description = "Show logs from the conformance test job"
+category = "Conformance"
+script_runner = "@shell"
+script = '''
+kubectl logs -n gateway-conformance-infra job/gateway-api-conformance --tail=-1
+'''
+
+[tasks.conformance]
+description = "Build, push, and run conformance tests (full workflow)"
+category = "Conformance"
+dependencies = ["conformance-build", "conformance-push", "conformance-run"]
+
+# Docker Build Tasks
+# These tasks build the control plane and data plane container images.
+
+[tasks.docker-setup-buildx]
+description = "Create and use a buildx builder for multi-platform builds"
+category = "Docker"
+script_runner = "@shell"
+script = '''
+# Check if multiway-builder exists, create if not
+if ! docker buildx inspect multiway-builder >/dev/null 2>&1; then
+  echo "Creating buildx builder: multiway-builder"
+  docker buildx create --name multiway-builder --use
+else
+  echo "Using existing buildx builder: multiway-builder"
+  docker buildx use multiway-builder
+fi
+docker buildx inspect --bootstrap
+'''
+
+[tasks.docker-build-controlplane]
+description = "Build control plane image for current platform"
+category = "Docker"
+script_runner = "@shell"
+script = '''
+docker build \
+  --target controlplane \
+  -t multiway-controlplane:latest \
+  -f "${DOCKERFILE:-Dockerfile}" \
+  .
+'''
+
+[tasks.docker-build-dataplane]
+description = "Build data plane image for current platform"
+category = "Docker"
+script_runner = "@shell"
+script = '''
+docker build \
+  --target dataplane \
+  -t multiway-dataplane:latest \
+  -f "${DOCKERFILE:-Dockerfile}" \
+  .
+'''
+
+[tasks.docker-build-all]
+description = "Build both control plane and data plane for current platform"
+category = "Docker"
+dependencies = ["docker-build-controlplane", "docker-build-dataplane"]
+
+[tasks.docker-build-controlplane-cross]
+description = "Build control plane image for both amd64 and arm64"
+category = "Docker"
+dependencies = ["docker-setup-buildx"]
+script_runner = "@shell"
+script = '''
+echo "Building control plane for multiple platforms..."
+echo "Note: Multi-platform images cannot be loaded into local Docker."
+echo "Use docker-build-controlplane for local development or docker-build-controlplane-push to publish."
+docker buildx build \
+  --target controlplane \
+  --platform linux/amd64,linux/arm64 \
+  -t multiway-controlplane:latest \
+  -f "${DOCKERFILE:-Dockerfile}" \
+  .
+'''
+
+[tasks.docker-build-dataplane-cross]
+description = "Build data plane image for both amd64 and arm64"
+category = "Docker"
+dependencies = ["docker-setup-buildx"]
+script_runner = "@shell"
+script = '''
+echo "Building data plane for multiple platforms..."
+echo "Note: Multi-platform images cannot be loaded into local Docker."
+echo "Use docker-build-dataplane for local development or docker-build-dataplane-push to publish."
+docker buildx build \
+  --target dataplane \
+  --platform linux/amd64,linux/arm64 \
+  -t multiway-dataplane:latest \
+  -f "${DOCKERFILE:-Dockerfile}" \
+  .
+'''
+
+[tasks.docker-build-all-cross]
+description = "Build both control plane and data plane for amd64 and arm64"
+category = "Docker"
+dependencies = ["docker-build-controlplane-cross", "docker-build-dataplane-cross"]
+
+[tasks.docker-build-controlplane-push]
+description = "Build and push control plane image for both amd64 and arm64"
+category = "Docker"
+dependencies = ["docker-setup-buildx"]
+script_runner = "@shell"
+script = '''
+if [ -z "$DOCKER_REGISTRY" ]; then
+  echo "Error: DOCKER_REGISTRY environment variable not set"
+  echo "Example: export DOCKER_REGISTRY=ghcr.io/myorg"
+  exit 1
+fi
+
+docker buildx build \
+  --target controlplane \
+  --platform linux/amd64,linux/arm64 \
+  -t ${DOCKER_REGISTRY}/multiway-controlplane:latest \
+  -f "${DOCKERFILE:-Dockerfile}" \
+  --push \
+  .
+'''
+
+[tasks.docker-build-dataplane-push]
+description = "Build and push data plane image for both amd64 and arm64"
+category = "Docker"
+dependencies = ["docker-setup-buildx"]
+script_runner = "@shell"
+script = '''
+if [ -z "$DOCKER_REGISTRY" ]; then
+  echo "Error: DOCKER_REGISTRY environment variable not set"
+  echo "Example: export DOCKER_REGISTRY=ghcr.io/myorg"
+  exit 1
+fi
+
+docker buildx build \
+  --target dataplane \
+  --platform linux/amd64,linux/arm64 \
+  -t ${DOCKER_REGISTRY}/multiway-dataplane:latest \
+  -f "${DOCKERFILE:-Dockerfile}" \
+  --push \
+  .
+'''
+
+[tasks.docker-build-all-push]
+description = "Build and push both images for amd64 and arm64"
+category = "Docker"
+dependencies = ["docker-build-controlplane-push", "docker-build-dataplane-push"]
+
+# Shell Script Linting Tasks
+# These tasks run ShellCheck to lint shell scripts in the repository.
+
+[tasks.shellcheck]
+description = "Run ShellCheck on all shell scripts"
+category = "Linting"
+script_runner = "bash"
+script = '''
+set -e
+echo "Running ShellCheck on shell scripts..."
+
+# Find all shell scripts and run shellcheck on them
+find . -type f -name "*.sh" \
+  -not -path "./target/*" \
+  -not -path "./.git/*" \
+  -print0 | xargs -0 shellcheck
+
+echo "ShellCheck passed!"
+'''
